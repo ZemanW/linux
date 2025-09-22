@@ -1,24 +1,28 @@
 name: Detect Malicious Commits
 
 on:
+  pull_request:
+    types: [opened, synchronize, reopened]
   push:
     branches:
       - '**'
-  pull_request:
-    types: [opened, synchronize, reopened]
 
 jobs:
   detect:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
 
     steps:
     # 1️⃣ Checkout repository
     - name: Checkout repository
       uses: actions/checkout@v4
       with:
-        fetch-depth: 5 # fetch full history if you want all commits; optional, see below
+        fetch-depth: 0  # fetch all commits so we can diff properly
 
-    # 2️⃣ Cache Python dependencies
+    # 2️⃣ Cache pip dependencies
     - name: Cache pip
       uses: actions/cache@v4
       with:
@@ -27,7 +31,7 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-pip-
 
-    # 3️⃣ Cache Hugging Face models
+    # 3️⃣ Cache Hugging Face models + Torch cache
     - name: Cache Hugging Face models
       uses: actions/cache@v4
       with:
@@ -35,8 +39,10 @@ jobs:
           ~/.cache/huggingface/hub
           ~/.cache/torch/hub
         key: ${{ runner.os }}-hf-${{ hashFiles('scripts/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-hf-
 
-    # 4️⃣ Set up Python
+    # 4️⃣ Setup Python
     - name: Setup Python
       uses: actions/setup-python@v4
       with:
@@ -57,12 +63,14 @@ jobs:
           exit 1
         fi
 
-    # 7️⃣ Detect commits
+    # 7️⃣ Run detection
     - name: Run anomaly detection
       run: |
         python scripts/detect_commit.py
+      # If script exits with 1, workflow fails → PR merge blocked
+      continue-on-error: false
 
-    # 8️⃣ Upload anomaly log
+    # 8️⃣ Upload anomaly log regardless of pass/fail
     - name: Upload anomaly log
       if: always()
       uses: actions/upload-artifact@v4
