@@ -20,7 +20,7 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
       with:
-        fetch-depth: 0  # fetch all commits so we can diff properly
+        fetch-depth: 5 # fetch all commits so we can diff properly
 
     # 2️⃣ Cache pip dependencies
     - name: Cache pip
