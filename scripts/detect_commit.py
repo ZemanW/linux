@@ -12,10 +12,14 @@ from datetime import datetime
 
 # --------- CONFIG -------------
 MODEL_NAME = "microsoft/codebert-base"
-MODEL_FILE = "model/iforest_model.pkl"   # path inside repo
+MODEL_FILE = "model/iforest_model.pkl"
+SCALER_FILE = "model/commit_scaler.pkl"
 LOG_FILE = "anomaly_log.txt"
 MAX_TOKENS = 512
 # ------------------------------
+
+# Clear old logs at start
+open(LOG_FILE, "w").close()
 
 def load_event():
     event_path = os.environ.get("GITHUB_EVENT_PATH")
@@ -29,7 +33,6 @@ def get_commit_shas(event):
     if event_name == "push" and "commits" in event:
         return [c.get("id") for c in event.get("commits", []) if c.get("id")]
     elif event_name == "pull_request" and "pull_request" in event:
-        # fetch base ref then list commits between base and head
         base_ref = event["pull_request"]["base"]["ref"]
         try:
             subprocess.run(["git", "fetch", "origin", base_ref], check=False)
@@ -39,18 +42,20 @@ def get_commit_shas(event):
         except Exception:
             return [os.environ.get("GITHUB_SHA")]
     else:
-        # fallback: just analyze current HEAD
         sha = os.environ.get("GITHUB_SHA")
         return [sha] if sha else []
 
 def git_show_diff(sha):
     try:
-        out = subprocess.check_output(["git", "show", "--pretty=format:%B", "--no-color", sha], stderr=subprocess.DEVNULL)
+        out = subprocess.check_output(
+            ["git", "show", "--pretty=format:%B", "--no-color", sha],
+            stderr=subprocess.DEVNULL
+        )
         return out.decode(errors="ignore")
     except Exception:
         return ""
 
-# --- load tokenizer + model (CodeBERT/RoBERTa-base)
+# Load model + tokenizer
 print("Loading tokenizer/model...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 model = AutoModel.from_pretrained(MODEL_NAME)
@@ -63,11 +68,10 @@ def embed_text_truncate(text):
     inputs = {k: v.to(device) for k, v in inputs.items()}
     with torch.no_grad():
         outputs = model(**inputs)
-        emb = outputs.last_hidden_state.mean(dim=1)   # mean pooling
+        emb = outputs.last_hidden_state.mean(dim=1)
     return emb.cpu().numpy()
 
 def embed_text_chunked(text):
-    # encode to token ids then chunk to MAX_TOKENS
     ids = tokenizer.encode(text, add_special_tokens=True)
     chunks = [ids[i:i+MAX_TOKENS] for i in range(0, len(ids), MAX_TOKENS)]
     vecs = []
@@ -83,32 +87,28 @@ def embed_text_chunked(text):
     return np.mean(np.vstack(vecs), axis=0, keepdims=True)
 
 def get_embedding_for_text(text):
-    # if tokenized length is small -> truncate (fast), else chunk (preserve more)
     toks = tokenizer.tokenize(text)
     if len(toks) <= MAX_TOKENS:
         return embed_text_truncate(text)
     return embed_text_chunked(text)
 
-# --- Load anomaly model
+# Load anomaly model
 if not os.path.exists(MODEL_FILE):
-    print(f"ERROR: model file not found at {MODEL_FILE}. Place your trained model there.", file=sys.stderr)
+    print(f"ERROR: model file not found at {MODEL_FILE}", file=sys.stderr)
     sys.exit(2)
 
 clf = joblib.load(MODEL_FILE)
 print("Anomaly model loaded.")
 
-# Optional: if your model expects scaled features, load scaler:
-SCALER_FILE = "model/commit_scaler.pkl"
-scaler = None
-if os.path.exists(SCALER_FILE):
-    scaler = joblib.load(SCALER_FILE)
+scaler = joblib.load(SCALER_FILE) if os.path.exists(SCALER_FILE) else None
+if scaler is not None:
     print("Scaler loaded.")
 
-# --- main logic
+# Process commits
 event = load_event()
 shas = get_commit_shas(event)
 repo = os.environ.get("GITHUB_REPOSITORY", "")
-token = os.environ.get("GITHUB_TOKEN", "")  # automatically provided by GitHub Actions
+token = os.environ.get("GITHUB_TOKEN", "")
 event_name = os.environ.get("GITHUB_EVENT_NAME", "")
 
 if not shas:
@@ -120,28 +120,28 @@ for sha in shas:
     if not sha:
         continue
     print(f"Processing commit {sha} ...")
-    diff = git_show_diff(sha)[:20000]  # safety limit: cap diff content to first 20k chars (adjust as needed)
-    embedding = get_embedding_for_text(diff)   # shape (1, d)
+    diff = git_show_diff(sha)[:20000]
+    if not diff.strip():
+        continue
 
-    # If you have additional tabular features, concatenate here
+    embedding = get_embedding_for_text(diff)
     X = embedding
     if scaler is not None:
         try:
             X = scaler.transform(X)
         except Exception:
-            pass
+            X = np.asarray(X).reshape(1, -1)
 
     try:
         pred = clf.predict(X)[0]
         score = float(clf.decision_function(X)[0]) if hasattr(clf, "decision_function") else None
-    except Exception as e:
-        # fallback reshape
-        X2 = np.asarray(X).reshape(1, -1)
-        pred = clf.predict(X2)[0]
-        score = float(clf.decision_function(X2)[0]) if hasattr(clf, "decision_function") else None
+    except Exception:
+        X = np.asarray(X).reshape(1, -1)
+        pred = clf.predict(X)[0]
+        score = float(clf.decision_function(X)[0]) if hasattr(clf, "decision_function") else None
 
     is_anom = (pred == -1)
-    # log line
+
     log_line = {
         "time": datetime.utcnow().isoformat()+"Z",
         "commit": sha,
@@ -153,12 +153,11 @@ for sha in shas:
 
     if is_anom:
         found_anomaly = True
-        # build message
         body = (
             f"⚠️ **Anomalous commit detected**\n\n"
             f"- **Commit**: `{sha}`\n"
             f"- **Score**: `{score}`\n\n"
-            f"Please review this commit immediately.\n\n"
+            f"Please review this commit.\n\n"
             f"---\n\n"
             f"```diff\n{diff}\n```\n"
         )
@@ -169,19 +168,16 @@ for sha in shas:
                 pr_number = event["pull_request"]["number"]
                 url = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments"
                 requests.post(url, json={"body": body}, headers=headers, timeout=15)
-                print(f"Posted PR comment to #{pr_number}")
             else:
-                # create an issue to alert maintainers
                 title = f"[security] anomalous commit detected: {sha}"
                 url = f"https://api.github.com/repos/{repo}/issues"
                 requests.post(url, json={"title": title, "body": body}, headers=headers, timeout=15)
-                print("Created an issue to alert maintainers.")
         except Exception as ex:
             print("Warning: failed to send GitHub notification:", ex)
 
-# exit non-zero if any anomalies to fail CI
+# Fail workflow if anomalies found
 if found_anomaly:
-    print("One or more anomalous commits were detected. See anomaly_log.txt.")
+    print("One or more anomalous commits detected. See anomaly_log.txt.")
     sys.exit(1)
 
 print("No anomalies found.")
